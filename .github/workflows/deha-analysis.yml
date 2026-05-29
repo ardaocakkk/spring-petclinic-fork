@@ -67,50 +67,70 @@ jobs:
           PR_URL:          ${{ github.event.pull_request.html_url }}
         run: |
           JACOCO_PATH="target/site/jacoco/jacoco.xml"
+          JACOCO_ARGS=""
+          if [ -f "$JACOCO_PATH" ]; then
+            echo "JaCoCo report found — attaching coverage"
+            JACOCO_ARGS="-F jacoco=@${JACOCO_PATH};type=application/xml"
+          else
+            echo "No jacoco.xml found — coverage skipped"
+          fi
 
-          # Build the curl command — add jacoco part only if the report exists
-          CMD=(curl -sf
-            -X POST "$DEHA_URL/api/analysis/scan"
-            -H "X-Api-Key: $DEHA_API_KEY"
-            -F "projectId=$DEHA_PROJECT_ID"
-            -F "branchName=$HEAD_BRANCH"
-            -F "commitHash=$COMMIT_SHA"
-            -F "sources=@deha-sources.zip;type=application/zip"
-          )
+          PR_ARGS=""
+          [ -n "$PR_ID"  ] && PR_ARGS="$PR_ARGS -F pullRequestId=$PR_ID"
+          [ -n "$PR_URL" ] && PR_ARGS="$PR_ARGS -F pullRequestUrl=$PR_URL"
 
-          [ -n "$PR_ID"  ] && CMD+=(-F "pullRequestId=$PR_ID")
-          [ -n "$PR_URL" ] && CMD+=(-F "pullRequestUrl=$PR_URL")
-          [ -f "$JACOCO_PATH" ] && CMD+=(-F "jacoco=@$JACOCO_PATH;type=application/xml") \
-                                || echo "No jacoco.xml found — coverage skipped"
+          # --fail-with-body: exit non-zero on HTTP error AND print the response body
+          # --max-time 30: don't hang indefinitely if the server is slow
+          HTTP_STATUS=$(curl \
+            --fail-with-body \
+            --max-time 30 \
+            -s \
+            -w "\n%{http_code}" \
+            -X POST "$DEHA_URL/api/analysis/scan" \
+            -H "X-Api-Key: $DEHA_API_KEY" \
+            -F "projectId=$DEHA_PROJECT_ID" \
+            -F "branchName=$HEAD_BRANCH" \
+            -F "commitHash=$COMMIT_SHA" \
+            -F "sources=@deha-sources.zip;type=application/zip" \
+            $JACOCO_ARGS \
+            $PR_ARGS \
+            -o /tmp/deha-response.json 2>&1) || true
 
-          RESPONSE=$("${CMD[@]}")
-          echo "Deha response: $RESPONSE"
-          ANALYSIS_ID=$(echo "$RESPONSE" | jq -r '.analysisId')
+          echo "HTTP status: $HTTP_STATUS"
+          echo "Deha response: $(cat /tmp/deha-response.json)"
+
+          ANALYSIS_ID=$(jq -r '.analysisId // empty' /tmp/deha-response.json 2>/dev/null || echo "")
+          if [ -z "$ANALYSIS_ID" ] || [ "$ANALYSIS_ID" = "null" ]; then
+            echo "::error::Deha did not return an analysisId. Check DEHA_URL is reachable from GitHub Actions runners."
+            exit 1
+          fi
+
           echo "analysisId=$ANALYSIS_ID" >> "$GITHUB_OUTPUT"
+          echo "Deha analysis started — id: $ANALYSIS_ID"
 
       # ── 6. Poll until complete ───────────────────────────────────────────────
       - name: Wait for analysis to complete
         id: result
         env:
-          DEHA_URL:    ${{ secrets.DEHA_URL }}
+          DEHA_URL:     ${{ secrets.DEHA_URL }}
           DEHA_API_KEY: ${{ secrets.DEHA_API_KEY }}
-          ANALYSIS_ID: ${{ steps.deha.outputs.analysisId }}
+          ANALYSIS_ID:  ${{ steps.deha.outputs.analysisId }}
         run: |
           echo "Polling analysis $ANALYSIS_ID ..."
+          STATUS=""
           for i in $(seq 1 60); do
-            RESULT=$(curl -sf \
+            RESULT=$(curl -s --max-time 15 \
               -H "X-Api-Key: $DEHA_API_KEY" \
-              "$DEHA_URL/api/analysis/$ANALYSIS_ID")
+              "$DEHA_URL/api/analysis/$ANALYSIS_ID" || echo '{}')
 
-            STATUS=$(echo "$RESULT" | jq -r '.status')
-            echo "Attempt $i — status: $STATUS"
+            STATUS=$(echo "$RESULT" | jq -r '.status // empty')
+            echo "Attempt $i — status: ${STATUS:-unreachable}"
 
             if [ "$STATUS" = "COMPLETED" ] || [ "$STATUS" = "FAILED" ]; then
-              echo "result=$RESULT"                                             >> "$GITHUB_OUTPUT"
               echo "status=$STATUS"                                             >> "$GITHUB_OUTPUT"
-              echo "criticalCount=$(echo "$RESULT" | jq -r '.criticalCount')"  >> "$GITHUB_OUTPUT"
-              echo "highCount=$(echo "$RESULT"     | jq -r '.highCount')"      >> "$GITHUB_OUTPUT"
-              echo "totalIssues=$(echo "$RESULT"   | jq -r '.totalIssues')"    >> "$GITHUB_OUTPUT"
+              echo "criticalCount=$(echo "$RESULT" | jq -r '.criticalCount // 0')"  >> "$GITHUB_OUTPUT"
+              echo "highCount=$(echo "$RESULT"     | jq -r '.highCount // 0')"      >> "$GITHUB_OUTPUT"
+              echo "totalIssues=$(echo "$RESULT"   | jq -r '.totalIssues // 0')"    >> "$GITHUB_OUTPUT"
               echo "lineCoverage=$(echo "$RESULT"  | jq -r '.coverage.lineCoverage // 0')" >> "$GITHUB_OUTPUT"
               echo "qualityGate=$(echo "$RESULT"   | jq -r '.qualityGateStatus // "NONE"')" >> "$GITHUB_OUTPUT"
               break
