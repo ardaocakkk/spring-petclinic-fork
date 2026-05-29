@@ -1,6 +1,6 @@
-# Deha Code Analysis — GitHub Actions Workflow
+# Deha Code Analysis — GitHub Actions Template
 #
-# Setup: add exactly 2 secrets to your repo
+# Setup: add exactly 2 secrets to your repository
 #   (Settings → Secrets and variables → Actions → New repository secret)
 #
 #   DEHA_URL    — your Deha server address, e.g. https://deha.example.com
@@ -12,11 +12,12 @@ name: Deha Code Analysis
 
 on:
   push:         # every branch push triggers analysis
-  pull_request: # PRs get analysis + PR comment
+  pull_request: # PRs get analysis + quality gate enforcement / PR comment
 
 permissions:
   pull-requests: write
   contents: read
+  checks: write  # needed for GitHub Check Runs (if enabled in project settings)
 
 jobs:
   deha-analysis:
@@ -63,6 +64,12 @@ jobs:
           PR_ID:       ${{ github.event.pull_request.number }}
           PR_URL:      ${{ github.event.pull_request.html_url }}
         run: |
+          # Capture the triggering commit's author so Deha can show "who introduced this issue".
+          COMMIT_AUTHOR_NAME=$(git log -1 --format='%an' "$COMMIT_SHA" 2>/dev/null || echo "")
+          COMMIT_AUTHOR_EMAIL=$(git log -1 --format='%ae' "$COMMIT_SHA" 2>/dev/null || echo "")
+          COMMIT_MESSAGE=$(git log -1 --format='%s' "$COMMIT_SHA" 2>/dev/null || echo "")
+          COMMIT_AUTHOR_DATE=$(git log -1 --format='%aI' "$COMMIT_SHA" 2>/dev/null || echo "")
+
           JACOCO_PATH="target/site/jacoco/jacoco.xml"
           JACOCO_ARGS=""
           if [ -f "$JACOCO_PATH" ]; then
@@ -85,6 +92,10 @@ jobs:
             -H "Authorization: Bearer $DEHA_TOKEN" \
             -F "branchName=$HEAD_BRANCH" \
             -F "commitHash=$COMMIT_SHA" \
+            -F "commitAuthorName=$COMMIT_AUTHOR_NAME" \
+            -F "commitAuthorEmail=$COMMIT_AUTHOR_EMAIL" \
+            -F "commitMessage=$COMMIT_MESSAGE" \
+            -F "commitAuthorDate=$COMMIT_AUTHOR_DATE" \
             -F "sources=@deha-sources.zip;type=application/zip" \
             $JACOCO_ARGS \
             $PR_ARGS \
@@ -121,10 +132,11 @@ jobs:
             echo "Attempt $i — status: ${STATUS:-unreachable}"
 
             if [ "$STATUS" = "COMPLETED" ] || [ "$STATUS" = "FAILED" ]; then
-              echo "status=$STATUS"                                             >> "$GITHUB_OUTPUT"
-              echo "criticalCount=$(echo "$RESULT" | jq -r '.criticalCount // 0')"  >> "$GITHUB_OUTPUT"
-              echo "highCount=$(echo "$RESULT"     | jq -r '.highCount // 0')"      >> "$GITHUB_OUTPUT"
-              echo "totalIssues=$(echo "$RESULT"   | jq -r '.totalIssues // 0')"    >> "$GITHUB_OUTPUT"
+              echo "status=$STATUS"                                                  >> "$GITHUB_OUTPUT"
+              echo "criticalCount=$(echo "$RESULT" | jq -r '.criticalCount // 0')"   >> "$GITHUB_OUTPUT"
+              echo "highCount=$(echo "$RESULT"     | jq -r '.highCount // 0')"       >> "$GITHUB_OUTPUT"
+              echo "totalIssues=$(echo "$RESULT"   | jq -r '.totalIssues // 0')"     >> "$GITHUB_OUTPUT"
+              echo "newIssues=$(echo "$RESULT"     | jq -r '.newIssueCount // 0')"   >> "$GITHUB_OUTPUT"
               echo "lineCoverage=$(echo "$RESULT"  | jq -r '.coverage.lineCoverage // 0')" >> "$GITHUB_OUTPUT"
               echo "qualityGate=$(echo "$RESULT"   | jq -r '.qualityGateStatus // "NONE"')" >> "$GITHUB_OUTPUT"
               break
@@ -146,6 +158,7 @@ jobs:
           CRITICAL_COUNT:  ${{ steps.result.outputs.criticalCount }}
           HIGH_COUNT:      ${{ steps.result.outputs.highCount }}
           TOTAL_ISSUES:    ${{ steps.result.outputs.totalIssues }}
+          NEW_ISSUES:      ${{ steps.result.outputs.newIssues }}
           LINE_COVERAGE:   ${{ steps.result.outputs.lineCoverage }}
           QUALITY_GATE:    ${{ steps.result.outputs.qualityGate }}
           ANALYSIS_ID:     ${{ steps.deha.outputs.analysisId }}
@@ -157,6 +170,7 @@ jobs:
             const critical   = parseInt(process.env.CRITICAL_COUNT  || '0');
             const high       = parseInt(process.env.HIGH_COUNT       || '0');
             const total      = parseInt(process.env.TOTAL_ISSUES     || '0');
+            const newIssues  = parseInt(process.env.NEW_ISSUES       || '0');
             const coverage   = parseFloat(process.env.LINE_COVERAGE  || '0').toFixed(1);
             const qg         = process.env.QUALITY_GATE;
             const analysisId = process.env.ANALYSIS_ID;
@@ -172,6 +186,7 @@ jobs:
               `|--------|-------|`,
               `| Quality Gate | ${qgEmoji[qg] ?? '—'} ${qg} |`,
               `| Total issues | ${total} |`,
+              `| New issues | ${newIssues} |`,
               `| Critical | ${critical} |`,
               `| High | ${high} |`,
               `| Line coverage | ${coverage}% |`,
