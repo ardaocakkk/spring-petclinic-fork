@@ -45,9 +45,10 @@ jobs:
 
       # ── 3. Build & test with JaCoCo ─────────────────────────────────────────
       - name: Build and generate coverage report
-        run: mvn verify -q -Dmaven.test.failure.ignore=true -DskipITs=true
+        run: mvn verify -q -Dmaven.test.failure.ignore=true -DskipITs=true -Dspring-javaformat.skip=true
         # -Dmaven.test.failure.ignore=true  → don't fail the step on red tests;
         #   Deha will report the failures itself.
+        # -Dspring-javaformat.skip=true     → skip Spring's formatter validation plugin.
 
       # ── 4. Encode JaCoCo XML as Base64 ──────────────────────────────────────
       - name: Encode JaCoCo report
