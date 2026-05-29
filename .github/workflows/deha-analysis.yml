@@ -1,14 +1,12 @@
 # Deha Code Analysis — GitHub Actions Workflow
 #
-# This workflow follows the same model as SonarQube:
-#   - The CI runner checks out the code and runs tests locally
-#   - It then SENDS the source files directly to the Deha server (scanner-push model)
-#   - Deha never needs to clone the repo — no GitHub credentials on the server side
+# Setup: add exactly 2 secrets to your repo
+#   (Settings → Secrets and variables → Actions → New repository secret)
 #
-# Setup (repo Settings → Secrets and variables → Actions):
-#   DEHA_URL         e.g. https://deha.example.com  (or ngrok URL for local dev)
-#   DEHA_API_KEY     value from application.yml → deha.api-key
-#   DEHA_PROJECT_ID  numeric project ID from the Deha dashboard
+#   DEHA_URL    — your Deha server address, e.g. https://deha.example.com
+#   DEHA_TOKEN  — copy from the project's CI/CD Integration section in the Deha UI
+#
+# That's it. No project ID, no global API key.
 
 name: Deha Code Analysis
 
@@ -58,13 +56,12 @@ jobs:
       - name: Send to Deha
         id: deha
         env:
-          DEHA_URL:        ${{ secrets.DEHA_URL }}
-          DEHA_API_KEY:    ${{ secrets.DEHA_API_KEY }}
-          DEHA_PROJECT_ID: ${{ secrets.DEHA_PROJECT_ID }}
-          HEAD_BRANCH:     ${{ github.head_ref || github.ref_name }}
-          COMMIT_SHA:      ${{ github.event.pull_request.head.sha || github.sha }}
-          PR_ID:           ${{ github.event.pull_request.number }}
-          PR_URL:          ${{ github.event.pull_request.html_url }}
+          DEHA_URL:    ${{ secrets.DEHA_URL }}
+          DEHA_TOKEN:  ${{ secrets.DEHA_TOKEN }}
+          HEAD_BRANCH: ${{ github.head_ref || github.ref_name }}
+          COMMIT_SHA:  ${{ github.event.pull_request.head.sha || github.sha }}
+          PR_ID:       ${{ github.event.pull_request.number }}
+          PR_URL:      ${{ github.event.pull_request.html_url }}
         run: |
           JACOCO_PATH="target/site/jacoco/jacoco.xml"
           JACOCO_ARGS=""
@@ -79,16 +76,13 @@ jobs:
           [ -n "$PR_ID"  ] && PR_ARGS="$PR_ARGS -F pullRequestId=$PR_ID"
           [ -n "$PR_URL" ] && PR_ARGS="$PR_ARGS -F pullRequestUrl=$PR_URL"
 
-          # --fail-with-body: exit non-zero on HTTP error AND print the response body
-          # --max-time 30: don't hang indefinitely if the server is slow
           HTTP_STATUS=$(curl \
             --fail-with-body \
             --max-time 30 \
             -s \
             -w "\n%{http_code}" \
             -X POST "$DEHA_URL/api/analysis/scan" \
-            -H "X-Api-Key: $DEHA_API_KEY" \
-            -F "projectId=$DEHA_PROJECT_ID" \
+            -H "Authorization: Bearer $DEHA_TOKEN" \
             -F "branchName=$HEAD_BRANCH" \
             -F "commitHash=$COMMIT_SHA" \
             -F "sources=@deha-sources.zip;type=application/zip" \
@@ -112,15 +106,15 @@ jobs:
       - name: Wait for analysis to complete
         id: result
         env:
-          DEHA_URL:     ${{ secrets.DEHA_URL }}
-          DEHA_API_KEY: ${{ secrets.DEHA_API_KEY }}
-          ANALYSIS_ID:  ${{ steps.deha.outputs.analysisId }}
+          DEHA_URL:    ${{ secrets.DEHA_URL }}
+          DEHA_TOKEN:  ${{ secrets.DEHA_TOKEN }}
+          ANALYSIS_ID: ${{ steps.deha.outputs.analysisId }}
         run: |
           echo "Polling analysis $ANALYSIS_ID ..."
           STATUS=""
           for i in $(seq 1 60); do
             RESULT=$(curl -s --max-time 15 \
-              -H "X-Api-Key: $DEHA_API_KEY" \
+              -H "Authorization: Bearer $DEHA_TOKEN" \
               "$DEHA_URL/api/analysis/$ANALYSIS_ID" || echo '{}')
 
             STATUS=$(echo "$RESULT" | jq -r '.status // empty')
