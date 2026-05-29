@@ -16,7 +16,9 @@ import java.util.Random;
 public class DehaTestController {
 
     private static final String AWS_SECRET_KEY = "AKIAQXYZTESTSECRETKEY"; // Hardcoded secret
+
     private static final String DB_PASSWORD = "supersecretpassword123"; // Another hardcoded credentials
+
 
     @Autowired
     private JdbcTemplate jdbcTemplate;
