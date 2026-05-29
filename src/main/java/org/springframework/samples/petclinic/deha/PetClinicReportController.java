@@ -4,9 +4,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import java.io.IOException;
 import java.io.InputStream;
 import java.util.Map;
 
@@ -23,9 +27,13 @@ public class PetClinicReportController {
 	@Autowired
 	private PetClinicReportService reportService;
 
+	@Autowired
+	private JdbcTemplate jdbcTemplate;
+
 	/**
 	 * Returns an owner report.
-	 * SEC-001 + SEC-010: SQL injection and log injection through user-controlled input.
+	 * SEC-001: SQL injection — string concat directly passed to jdbcTemplate.execute().
+	 * SEC-010: log injection through user-controlled input.
 	 */
 	@GetMapping("/owner")
 	public ResponseEntity<String> getOwnerReport(@RequestParam String ownerId,
@@ -33,8 +41,21 @@ public class PetClinicReportController {
 
 		log.info("Report requested for owner: " + ownerId + " type: " + type); // SEC-010
 
+		// SEC-001: direct SQL injection via executeQuery
+		String query = "SELECT * FROM owners WHERE id = '" + ownerId + "'";
+		jdbcTemplate.execute(query);
+
 		String report = reportService.generateOwnerReport(ownerId, type);
 		return ResponseEntity.ok(report);
+	}
+
+	/**
+	 * SEC-002: XSS — writes request parameter directly to HttpServletResponse.
+	 */
+	@GetMapping("/search")
+	public void searchOwner(HttpServletRequest request, HttpServletResponse response) throws IOException {
+		String query = request.getParameter("q");
+		response.getWriter().print("<html><body>Search results for: " + query + "</body></html>");
 	}
 
 	/**
