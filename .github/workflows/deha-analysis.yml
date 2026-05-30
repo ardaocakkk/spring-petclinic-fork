@@ -1,27 +1,41 @@
-# Deha Code Analysis — GitHub Actions Template
+# Deha Code Analysis — GitHub Actions Template (fire-and-forget)
 #
-# Setup: add exactly 2 secrets to your repository
-#   (Settings → Secrets and variables → Actions → New repository secret)
+# Deha runs LLM-powered analysis server-side; it can take several minutes.
+# This workflow does NOT wait for it. The runner only builds, packages and
+# uploads the sources, then exits in seconds — no runner minutes are burned
+# idling, and the job can never time out waiting on the analysis.
 #
-#   DEHA_URL    — your Deha server address, e.g. https://deha.example.com
-#   DEHA_TOKEN  — copy from the project's CI/CD Integration section in the Deha UI
+# The Deha server reports the result back to GitHub itself as a Check Run on
+# the commit ("Deha Analysis ✅ / ❌"). Merges are gated by branch protection,
+# not by this workflow's exit code.
 #
-# That's it. No project ID, no global API key.
+# ── One-time setup ────────────────────────────────────────────────────────────
+#   1. Repo secrets (Settings → Secrets and variables → Actions):
+#        DEHA_URL    — your Deha server, e.g. https://deha.example.com
+#        DEHA_TOKEN  — copy from the project's CI/CD Integration section in Deha
+#
+#   2. In the Deha project settings, enable "GitHub Checks" and paste a GitHub
+#      token (fine-grained PAT with checks:write, or classic token with repo
+#      scope). This is what lets the server post the ✅/❌ status.
+#
+#   3. To block merges on a failing analysis:
+#        Settings → Branches → Branch protection rule →
+#        "Require status checks to pass" → select "Deha Analysis".
+#
+# That's it. No polling, no API key, no project ID.
 
 name: Deha Code Analysis
 
 on:
-  push:         # every branch push triggers analysis
-  pull_request: # PRs get analysis + quality gate enforcement / PR comment
+  push:
+  pull_request:
 
 permissions:
-  pull-requests: write
   contents: read
-  checks: write  # needed for GitHub Check Runs (if enabled in project settings)
 
 jobs:
   deha-analysis:
-    name: Run Deha Analysis
+    name: Submit to Deha
     runs-on: ubuntu-latest
 
     steps:
@@ -44,18 +58,14 @@ jobs:
         run: mvn verify -q -Dmaven.test.failure.ignore=true -DskipITs=true -Dspring-javaformat.skip=true
 
       # ── 4. Package sources into a zip ───────────────────────────────────────
-      # Send ONLY Java source files — no binaries, no .git.
-      # Deha analyzes whatever .java files it receives, matching SonarQube's
-      # scanner-push model where the CI runner sends the code to the server.
       - name: Package source files
         run: |
           find src/main/java -name "*.java" > /tmp/java-files.txt
           zip -@ deha-sources.zip < /tmp/java-files.txt
           echo "Packaged $(wc -l < /tmp/java-files.txt) Java files ($(du -sh deha-sources.zip | cut -f1))"
 
-      # ── 5. Send to Deha (scanner-push) ──────────────────────────────────────
-      - name: Send to Deha
-        id: deha
+      # ── 5. Submit to Deha and exit (fire-and-forget) ────────────────────────
+      - name: Submit analysis to Deha
         env:
           DEHA_URL:    ${{ secrets.DEHA_URL }}
           DEHA_TOKEN:  ${{ secrets.DEHA_TOKEN }}
@@ -83,11 +93,11 @@ jobs:
           [ -n "$PR_ID"  ] && PR_ARGS="$PR_ARGS -F pullRequestId=$PR_ID"
           [ -n "$PR_URL" ] && PR_ARGS="$PR_ARGS -F pullRequestUrl=$PR_URL"
 
-          HTTP_STATUS=$(curl \
+          # --max-time covers only the upload; the analysis itself runs async server-side.
+          curl \
             --fail-with-body \
-            --max-time 30 \
+            --max-time 120 \
             -s \
-            -w "\n%{http_code}" \
             -X POST "$DEHA_URL/api/analysis/scan" \
             -H "Authorization: Bearer $DEHA_TOKEN" \
             -F "branchName=$HEAD_BRANCH" \
@@ -99,118 +109,18 @@ jobs:
             -F "sources=@deha-sources.zip;type=application/zip" \
             $JACOCO_ARGS \
             $PR_ARGS \
-            -o /tmp/deha-response.json 2>&1) || true
+            -o /tmp/deha-response.json
 
-          echo "HTTP status: $HTTP_STATUS"
           echo "Deha response: $(cat /tmp/deha-response.json)"
 
           ANALYSIS_ID=$(jq -r '.analysisId // empty' /tmp/deha-response.json 2>/dev/null || echo "")
           if [ -z "$ANALYSIS_ID" ] || [ "$ANALYSIS_ID" = "null" ]; then
-            echo "::error::Deha did not return an analysisId. Check DEHA_URL is reachable from GitHub Actions runners."
+            echo "::error::Deha did not accept the analysis. Check DEHA_URL is reachable and DEHA_TOKEN is valid."
             exit 1
           fi
 
-          echo "analysisId=$ANALYSIS_ID" >> "$GITHUB_OUTPUT"
-          echo "Deha analysis started — id: $ANALYSIS_ID"
-
-      # ── 6. Poll until complete ───────────────────────────────────────────────
-      - name: Wait for analysis to complete
-        id: result
-        env:
-          DEHA_URL:    ${{ secrets.DEHA_URL }}
-          DEHA_TOKEN:  ${{ secrets.DEHA_TOKEN }}
-          ANALYSIS_ID: ${{ steps.deha.outputs.analysisId }}
-        run: |
-          echo "Polling analysis $ANALYSIS_ID ..."
-          STATUS=""
-          for i in $(seq 1 60); do
-            RESULT=$(curl -s --max-time 15 \
-              -H "Authorization: Bearer $DEHA_TOKEN" \
-              "$DEHA_URL/api/analysis/$ANALYSIS_ID" || echo '{}')
-
-            STATUS=$(echo "$RESULT" | jq -r '.status // empty')
-            echo "Attempt $i — status: ${STATUS:-unreachable}"
-
-            if [ "$STATUS" = "COMPLETED" ] || [ "$STATUS" = "FAILED" ]; then
-              echo "status=$STATUS"                                                  >> "$GITHUB_OUTPUT"
-              echo "criticalCount=$(echo "$RESULT" | jq -r '.criticalCount // 0')"   >> "$GITHUB_OUTPUT"
-              echo "highCount=$(echo "$RESULT"     | jq -r '.highCount // 0')"       >> "$GITHUB_OUTPUT"
-              echo "totalIssues=$(echo "$RESULT"   | jq -r '.totalIssues // 0')"     >> "$GITHUB_OUTPUT"
-              echo "newIssues=$(echo "$RESULT"     | jq -r '.newIssueCount // 0')"   >> "$GITHUB_OUTPUT"
-              echo "lineCoverage=$(echo "$RESULT"  | jq -r '.coverage.lineCoverage // 0')" >> "$GITHUB_OUTPUT"
-              echo "qualityGate=$(echo "$RESULT"   | jq -r '.qualityGateStatus // "NONE"')" >> "$GITHUB_OUTPUT"
-              break
-            fi
-            sleep 10
-          done
-
-          if [ "$STATUS" != "COMPLETED" ] && [ "$STATUS" != "FAILED" ]; then
-            echo "Timed out waiting for Deha analysis." >&2
-            exit 1
-          fi
-
-      # ── 7. Post PR comment ───────────────────────────────────────────────────
-      - name: Post analysis summary to PR
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        env:
-          ANALYSIS_STATUS: ${{ steps.result.outputs.status }}
-          CRITICAL_COUNT:  ${{ steps.result.outputs.criticalCount }}
-          HIGH_COUNT:      ${{ steps.result.outputs.highCount }}
-          TOTAL_ISSUES:    ${{ steps.result.outputs.totalIssues }}
-          NEW_ISSUES:      ${{ steps.result.outputs.newIssues }}
-          LINE_COVERAGE:   ${{ steps.result.outputs.lineCoverage }}
-          QUALITY_GATE:    ${{ steps.result.outputs.qualityGate }}
-          ANALYSIS_ID:     ${{ steps.deha.outputs.analysisId }}
-          DEHA_URL:        ${{ secrets.DEHA_URL }}
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const status     = process.env.ANALYSIS_STATUS;
-            const critical   = parseInt(process.env.CRITICAL_COUNT  || '0');
-            const high       = parseInt(process.env.HIGH_COUNT       || '0');
-            const total      = parseInt(process.env.TOTAL_ISSUES     || '0');
-            const newIssues  = parseInt(process.env.NEW_ISSUES       || '0');
-            const coverage   = parseFloat(process.env.LINE_COVERAGE  || '0').toFixed(1);
-            const qg         = process.env.QUALITY_GATE;
-            const analysisId = process.env.ANALYSIS_ID;
-            const dehaUrl    = process.env.DEHA_URL;
-
-            const qgEmoji = { PASSED: '✅', FAILED: '❌', WARNING: '⚠️', NONE: '—' };
-            const statusEmoji = status === 'COMPLETED' ? '✅' : '❌';
-
-            const body = [
-              `## ${statusEmoji} Deha Analysis — ${status}`,
-              '',
-              `| Metric | Value |`,
-              `|--------|-------|`,
-              `| Quality Gate | ${qgEmoji[qg] ?? '—'} ${qg} |`,
-              `| Total issues | ${total} |`,
-              `| New issues | ${newIssues} |`,
-              `| Critical | ${critical} |`,
-              `| High | ${high} |`,
-              `| Line coverage | ${coverage}% |`,
-              '',
-              critical > 0 ? `> 🔴 **${critical} critical issue(s) found** — fix before merging` : '_No critical issues._',
-              '',
-              `[View full report](${dehaUrl}/analysis/${analysisId})`,
-            ].join('\n');
-
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body,
-            });
-
-      # ── 8. Fail on quality gate ──────────────────────────────────────────────
-      - name: Enforce quality gate
-        env:
-          QUALITY_GATE:    ${{ steps.result.outputs.qualityGate }}
-          CRITICAL_COUNT:  ${{ steps.result.outputs.criticalCount }}
-        run: |
-          if [ "$QUALITY_GATE" = "FAILED" ]; then
-            echo "::error::Deha Quality Gate FAILED ($CRITICAL_COUNT critical issue(s)). Fix them before merging."
-            exit 1
-          fi
-          echo "Quality Gate: $QUALITY_GATE — build passes."
+          echo "✅ Analysis #$ANALYSIS_ID submitted — Deha will post the result as a commit check."
+          echo "   Live report: $DEHA_URL/analysis/$ANALYSIS_ID"
+          echo "### 🚀 Deha analysis #$ANALYSIS_ID submitted" >> "$GITHUB_STEP_SUMMARY"
+          echo "Deha runs the analysis server-side and reports back as a **Deha Analysis** commit check." >> "$GITHUB_STEP_SUMMARY"
+          echo "[View live report]($DEHA_URL/analysis/$ANALYSIS_ID)" >> "$GITHUB_STEP_SUMMARY"
