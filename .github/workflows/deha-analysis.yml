@@ -1,27 +1,23 @@
-# Deha Code Analysis — GitHub Actions Workflow
+# Deha Code Analysis — GitHub Actions Template
 #
-# Setup:
-#   1. Go to your repo → Settings → Secrets and variables → Actions
-#   2. Add DEHA_URL        e.g. https://deha.example.com
-#   3. Add DEHA_API_KEY    the value you set in application.yml deha.api-key
-#   4. Add DEHA_PROJECT_ID the numeric project ID from the Deha dashboard
+# Setup: add exactly 2 secrets to your repository
+#   (Settings → Secrets and variables → Actions → New repository secret)
 #
-# Optional (PR comments):
-#   5. GITHUB_TOKEN is provided automatically — no setup needed.
+#   DEHA_URL    — your Deha server address, e.g. https://deha.example.com
+#   DEHA_TOKEN  — copy from the project's CI/CD Integration section in the Deha UI
 #
-# Copy this file to .github/workflows/deha-analysis.yml in your repository.
+# That's it. No project ID, no global API key.
 
 name: Deha Code Analysis
 
 on:
-  pull_request:
-    branches: ["main", "master", "develop"]
-  push:
-    branches: ["main", "master"]
+  push:         # every branch push triggers analysis
+  pull_request: # PRs get analysis + quality gate enforcement / PR comment
 
 permissions:
-  pull-requests: write   # allows posting PR comments
+  pull-requests: write
   contents: read
+  checks: write  # needed for GitHub Check Runs (if enabled in project settings)
 
 jobs:
   deha-analysis:
@@ -33,7 +29,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # full history needed for branch diff
+          fetch-depth: 0
 
       # ── 2. Java setup ───────────────────────────────────────────────────────
       - name: Set up JDK 17
@@ -46,95 +42,103 @@ jobs:
       # ── 3. Build & test with JaCoCo ─────────────────────────────────────────
       - name: Build and generate coverage report
         run: mvn verify -q -Dmaven.test.failure.ignore=true -DskipITs=true -Dspring-javaformat.skip=true
-        # -Dmaven.test.failure.ignore=true  → don't fail the step on red tests;
-        #   Deha will report the failures itself.
-        # -Dspring-javaformat.skip=true     → skip Spring's formatter validation plugin.
 
-      # ── 4. Encode JaCoCo XML as Base64 ──────────────────────────────────────
-      - name: Encode JaCoCo report
-        id: jacoco
+      # ── 4. Package sources into a zip ───────────────────────────────────────
+      # Send ONLY Java source files — no binaries, no .git.
+      # Deha analyzes whatever .java files it receives, matching SonarQube's
+      # scanner-push model where the CI runner sends the code to the server.
+      - name: Package source files
         run: |
-          JACOCO_PATH="target/site/jacoco/jacoco.xml"
-          if [ -f "$JACOCO_PATH" ]; then
-            echo "found=true" >> "$GITHUB_OUTPUT"
-            echo "xml=$(base64 -w 0 "$JACOCO_PATH")" >> "$GITHUB_OUTPUT"
-          else
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "No jacoco.xml found at $JACOCO_PATH" >&2
-          fi
+          find src/main/java -name "*.java" > /tmp/java-files.txt
+          zip -@ deha-sources.zip < /tmp/java-files.txt
+          echo "Packaged $(wc -l < /tmp/java-files.txt) Java files ($(du -sh deha-sources.zip | cut -f1))"
 
-      # ── 5. Trigger Deha analysis ─────────────────────────────────────────────
-      - name: Trigger Deha analysis
+      # ── 5. Send to Deha (scanner-push) ──────────────────────────────────────
+      - name: Send to Deha
         id: deha
         env:
-          DEHA_URL: ${{ secrets.DEHA_URL }}
-          DEHA_API_KEY: ${{ secrets.DEHA_API_KEY }}
-          DEHA_PROJECT_ID: ${{ secrets.DEHA_PROJECT_ID }}
-          JACOCO_FOUND: ${{ steps.jacoco.outputs.found }}
-          JACOCO_XML: ${{ steps.jacoco.outputs.xml }}
-          PR_ID: ${{ github.event.pull_request.number }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
+          DEHA_URL:    ${{ secrets.DEHA_URL }}
+          DEHA_TOKEN:  ${{ secrets.DEHA_TOKEN }}
           HEAD_BRANCH: ${{ github.head_ref || github.ref_name }}
-          BASE_BRANCH: ${{ github.base_ref || 'main' }}
-          COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          COMMIT_SHA:  ${{ github.event.pull_request.head.sha || github.sha }}
+          PR_ID:       ${{ github.event.pull_request.number }}
+          PR_URL:      ${{ github.event.pull_request.html_url }}
         run: |
-          # Build payload
-          PAYLOAD=$(jq -n \
-            --argjson projectId "$DEHA_PROJECT_ID" \
-            --arg branchName "$HEAD_BRANCH" \
-            --arg baseBranchName "$BASE_BRANCH" \
-            --arg commitHash "$COMMIT_SHA" \
-            --arg pullRequestId "${PR_ID:-}" \
-            --arg pullRequestUrl "${PR_URL:-}" \
-            '{
-              projectId: $projectId,
-              branchName: $branchName,
-              baseBranchName: $baseBranchName,
-              commitHash: $commitHash,
-              pullRequestId: (if $pullRequestId == "" then null else $pullRequestId end),
-              pullRequestUrl: (if $pullRequestUrl == "" then null else $pullRequestUrl end)
-            }')
+          # Capture the triggering commit's author so Deha can show "who introduced this issue".
+          COMMIT_AUTHOR_NAME=$(git log -1 --format='%an' "$COMMIT_SHA" 2>/dev/null || echo "")
+          COMMIT_AUTHOR_EMAIL=$(git log -1 --format='%ae' "$COMMIT_SHA" 2>/dev/null || echo "")
+          COMMIT_MESSAGE=$(git log -1 --format='%s' "$COMMIT_SHA" 2>/dev/null || echo "")
+          COMMIT_AUTHOR_DATE=$(git log -1 --format='%aI' "$COMMIT_SHA" 2>/dev/null || echo "")
 
-          # Attach JaCoCo XML if available
-          if [ "$JACOCO_FOUND" = "true" ]; then
-            PAYLOAD=$(echo "$PAYLOAD" | jq --arg xml "$JACOCO_XML" '. + {jacocoXmlBase64: $xml}')
+          JACOCO_PATH="target/site/jacoco/jacoco.xml"
+          JACOCO_ARGS=""
+          if [ -f "$JACOCO_PATH" ]; then
+            echo "JaCoCo report found — attaching coverage"
+            JACOCO_ARGS="-F jacoco=@${JACOCO_PATH};type=application/xml"
+          else
+            echo "No jacoco.xml found — coverage skipped"
           fi
 
-          # POST to Deha
-          RESPONSE=$(curl -sf \
-            -X POST "$DEHA_URL/api/analysis/trigger" \
-            -H "Content-Type: application/json" \
-            -H "X-Api-Key: $DEHA_API_KEY" \
-            -d "$PAYLOAD")
+          PR_ARGS=""
+          [ -n "$PR_ID"  ] && PR_ARGS="$PR_ARGS -F pullRequestId=$PR_ID"
+          [ -n "$PR_URL" ] && PR_ARGS="$PR_ARGS -F pullRequestUrl=$PR_URL"
 
-          echo "Deha response: $RESPONSE"
-          ANALYSIS_ID=$(echo "$RESPONSE" | jq -r '.analysisId')
+          HTTP_STATUS=$(curl \
+            --fail-with-body \
+            --max-time 30 \
+            -s \
+            -w "\n%{http_code}" \
+            -X POST "$DEHA_URL/api/analysis/scan" \
+            -H "Authorization: Bearer $DEHA_TOKEN" \
+            -F "branchName=$HEAD_BRANCH" \
+            -F "commitHash=$COMMIT_SHA" \
+            -F "commitAuthorName=$COMMIT_AUTHOR_NAME" \
+            -F "commitAuthorEmail=$COMMIT_AUTHOR_EMAIL" \
+            -F "commitMessage=$COMMIT_MESSAGE" \
+            -F "commitAuthorDate=$COMMIT_AUTHOR_DATE" \
+            -F "sources=@deha-sources.zip;type=application/zip" \
+            $JACOCO_ARGS \
+            $PR_ARGS \
+            -o /tmp/deha-response.json 2>&1) || true
+
+          echo "HTTP status: $HTTP_STATUS"
+          echo "Deha response: $(cat /tmp/deha-response.json)"
+
+          ANALYSIS_ID=$(jq -r '.analysisId // empty' /tmp/deha-response.json 2>/dev/null || echo "")
+          if [ -z "$ANALYSIS_ID" ] || [ "$ANALYSIS_ID" = "null" ]; then
+            echo "::error::Deha did not return an analysisId. Check DEHA_URL is reachable from GitHub Actions runners."
+            exit 1
+          fi
+
           echo "analysisId=$ANALYSIS_ID" >> "$GITHUB_OUTPUT"
+          echo "Deha analysis started — id: $ANALYSIS_ID"
 
-      # ── 6. Poll until analysis completes ────────────────────────────────────
+      # ── 6. Poll until complete ───────────────────────────────────────────────
       - name: Wait for analysis to complete
         id: result
         env:
-          DEHA_URL: ${{ secrets.DEHA_URL }}
-          DEHA_API_KEY: ${{ secrets.DEHA_API_KEY }}
+          DEHA_URL:    ${{ secrets.DEHA_URL }}
+          DEHA_TOKEN:  ${{ secrets.DEHA_TOKEN }}
           ANALYSIS_ID: ${{ steps.deha.outputs.analysisId }}
         run: |
           echo "Polling analysis $ANALYSIS_ID ..."
+          STATUS=""
           for i in $(seq 1 60); do
-            RESULT=$(curl -sf \
-              -H "X-Api-Key: $DEHA_API_KEY" \
-              "$DEHA_URL/api/analysis/$ANALYSIS_ID")
+            RESULT=$(curl -s --max-time 15 \
+              -H "Authorization: Bearer $DEHA_TOKEN" \
+              "$DEHA_URL/api/analysis/$ANALYSIS_ID" || echo '{}')
 
-            STATUS=$(echo "$RESULT" | jq -r '.status')
-            echo "Attempt $i — status: $STATUS"
+            STATUS=$(echo "$RESULT" | jq -r '.status // empty')
+            echo "Attempt $i — status: ${STATUS:-unreachable}"
 
             if [ "$STATUS" = "COMPLETED" ] || [ "$STATUS" = "FAILED" ]; then
-              echo "result=$RESULT" >> "$GITHUB_OUTPUT"
-              echo "status=$STATUS" >> "$GITHUB_OUTPUT"
-              echo "criticalCount=$(echo "$RESULT" | jq -r '.criticalCount')" >> "$GITHUB_OUTPUT"
-              echo "highCount=$(echo "$RESULT"     | jq -r '.highCount')"     >> "$GITHUB_OUTPUT"
-              echo "totalIssues=$(echo "$RESULT"   | jq -r '.totalIssues')"   >> "$GITHUB_OUTPUT"
+              echo "status=$STATUS"                                                  >> "$GITHUB_OUTPUT"
+              echo "criticalCount=$(echo "$RESULT" | jq -r '.criticalCount // 0')"   >> "$GITHUB_OUTPUT"
+              echo "highCount=$(echo "$RESULT"     | jq -r '.highCount // 0')"       >> "$GITHUB_OUTPUT"
+              echo "totalIssues=$(echo "$RESULT"   | jq -r '.totalIssues // 0')"     >> "$GITHUB_OUTPUT"
+              echo "newIssues=$(echo "$RESULT"     | jq -r '.newIssueCount // 0')"   >> "$GITHUB_OUTPUT"
               echo "lineCoverage=$(echo "$RESULT"  | jq -r '.coverage.lineCoverage // 0')" >> "$GITHUB_OUTPUT"
+              echo "qualityGate=$(echo "$RESULT"   | jq -r '.qualityGateStatus // "NONE"')" >> "$GITHUB_OUTPUT"
               break
             fi
             sleep 10
@@ -145,46 +149,49 @@ jobs:
             exit 1
           fi
 
-      # ── 7. Post PR comment with results ─────────────────────────────────────
+      # ── 7. Post PR comment ───────────────────────────────────────────────────
       - name: Post analysis summary to PR
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         env:
           ANALYSIS_STATUS: ${{ steps.result.outputs.status }}
-          CRITICAL_COUNT: ${{ steps.result.outputs.criticalCount }}
-          HIGH_COUNT: ${{ steps.result.outputs.highCount }}
-          TOTAL_ISSUES: ${{ steps.result.outputs.totalIssues }}
-          LINE_COVERAGE: ${{ steps.result.outputs.lineCoverage }}
-          ANALYSIS_ID: ${{ steps.deha.outputs.analysisId }}
-          DEHA_URL: ${{ secrets.DEHA_URL }}
+          CRITICAL_COUNT:  ${{ steps.result.outputs.criticalCount }}
+          HIGH_COUNT:      ${{ steps.result.outputs.highCount }}
+          TOTAL_ISSUES:    ${{ steps.result.outputs.totalIssues }}
+          NEW_ISSUES:      ${{ steps.result.outputs.newIssues }}
+          LINE_COVERAGE:   ${{ steps.result.outputs.lineCoverage }}
+          QUALITY_GATE:    ${{ steps.result.outputs.qualityGate }}
+          ANALYSIS_ID:     ${{ steps.deha.outputs.analysisId }}
+          DEHA_URL:        ${{ secrets.DEHA_URL }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const status      = process.env.ANALYSIS_STATUS;
-            const critical    = parseInt(process.env.CRITICAL_COUNT || '0');
-            const high        = parseInt(process.env.HIGH_COUNT || '0');
-            const total       = parseInt(process.env.TOTAL_ISSUES || '0');
-            const coverage    = parseFloat(process.env.LINE_COVERAGE || '0').toFixed(1);
-            const analysisId  = process.env.ANALYSIS_ID;
-            const dehaUrl     = process.env.DEHA_URL;
+            const status     = process.env.ANALYSIS_STATUS;
+            const critical   = parseInt(process.env.CRITICAL_COUNT  || '0');
+            const high       = parseInt(process.env.HIGH_COUNT       || '0');
+            const total      = parseInt(process.env.TOTAL_ISSUES     || '0');
+            const newIssues  = parseInt(process.env.NEW_ISSUES       || '0');
+            const coverage   = parseFloat(process.env.LINE_COVERAGE  || '0').toFixed(1);
+            const qg         = process.env.QUALITY_GATE;
+            const analysisId = process.env.ANALYSIS_ID;
+            const dehaUrl    = process.env.DEHA_URL;
 
+            const qgEmoji = { PASSED: '✅', FAILED: '❌', WARNING: '⚠️', NONE: '—' };
             const statusEmoji = status === 'COMPLETED' ? '✅' : '❌';
-            const criticalBadge = critical > 0 ? `🔴 **${critical} Critical**` : '';
-            const highBadge     = high > 0     ? `🟠 **${high} High**`     : '';
 
             const body = [
               `## ${statusEmoji} Deha Analysis — ${status}`,
               '',
               `| Metric | Value |`,
               `|--------|-------|`,
+              `| Quality Gate | ${qgEmoji[qg] ?? '—'} ${qg} |`,
               `| Total issues | ${total} |`,
+              `| New issues | ${newIssues} |`,
               `| Critical | ${critical} |`,
               `| High | ${high} |`,
               `| Line coverage | ${coverage}% |`,
               '',
-              criticalBadge || highBadge
-                ? `> ${[criticalBadge, highBadge].filter(Boolean).join('  ')}`
-                : '_No critical or high issues found._',
+              critical > 0 ? `> 🔴 **${critical} critical issue(s) found** — fix before merging` : '_No critical issues._',
               '',
               `[View full report](${dehaUrl}/analysis/${analysisId})`,
             ].join('\n');
@@ -196,9 +203,14 @@ jobs:
               body,
             });
 
-      # ── 8. Fail the build if critical issues found ───────────────────────────
-      - name: Fail on critical issues
-        if: steps.result.outputs.criticalCount > 0
+      # ── 8. Fail on quality gate ──────────────────────────────────────────────
+      - name: Enforce quality gate
+        env:
+          QUALITY_GATE:    ${{ steps.result.outputs.qualityGate }}
+          CRITICAL_COUNT:  ${{ steps.result.outputs.criticalCount }}
         run: |
-          echo "::error::Deha found ${{ steps.result.outputs.criticalCount }} critical issue(s). Fix them before merging."
-          exit 1
+          if [ "$QUALITY_GATE" = "FAILED" ]; then
+            echo "::error::Deha Quality Gate FAILED ($CRITICAL_COUNT critical issue(s)). Fix them before merging."
+            exit 1
+          fi
+          echo "Quality Gate: $QUALITY_GATE — build passes."
